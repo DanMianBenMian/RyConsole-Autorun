@@ -144,7 +144,7 @@ Agent 发来的代码会自动回显到 GUI 编辑区，用户看得见。
 
 1. **`print()` 就是回传通道**：所有中间信息用 `print(...)` 输出，会收在 `output` 里。
 2. **`return` 是结果通道**：最后 `return` 的对象/字符串进 `result`。
-3. 代码里可以直接调用**已注册的原生原语**（63 个，见下节「原生桥清单」）——
+3. 代码里可以直接调用**已注册的原生原语**（67 个，见下节「原生桥清单」）——
    不要凭猜测写 API，**先用清单核对**再写；清单里没有的接口就是没有。
 4. **把结果做成 JSON 字符串再 return**，比返回裸对象更稳（可读、可解析）。
 5. **单步优先**：一轮一件事。跑得越久越容易触发超时和 panic，也更难定位。
@@ -172,7 +172,7 @@ return JSON.stringify(out);
 
 ## 原生桥清单（写在探针前先核对这张表）
 
-**全部 63 个原语**都已注册为全局函数。每次执行都是**全新 JSContext**（跨轮次变量不保留 → 要状态就落盘）。
+**全部 67 个原语**都已注册为全局函数。每次执行都是**全新 JSContext**（跨轮次变量不保留 → 要状态就落盘）。
 安全分级：🟢只读 / 🟡有副作用 / 🔴高危（人工确认）。
 
 ### IOKit 内核接口（核心）🟢
@@ -201,6 +201,17 @@ return JSON.stringify(out);
 | **`xpcClose`** | `(h) → "ok"` | 关闭并释放 |
 | **`machLookUp`** | `(svc) → {kr, port}` | bootstrap_look_up 原始版：kr=0 成功，port 为 mach 句柄名 |
 | `xpcCall`（bridge_xpc.js） | `(svc, msg, timeoutSec)` | 一次性封装：连接→发→收→关，探针最常用 |
+
+### ObjC runtime 万用桥（V2.1 新增，2026-09-13）🔴最高能级
+| 原语 | 签名 | 说明 |
+|---|---|---|
+| **`objc_getClass`** | `(name) → "0x…"` | 类指针句柄（Class 永生，句柄跨轮次稳定） |
+| **`sel_registerName`** | `(name) → "0x…"` | SEL 句柄（永生） |
+| **`objc_msgSend`** | `(recv, sel, args) → "0x…"` | 万能调用。recv=0x 句柄(0=nil)；sel=名字(自动注册)或 0x 句柄；args 规则：字符串→自动包 NSString、数字→uint64 位槽(BOOL/int/long 位传)、`{hex:"0x.."}`→原始指针、null→nil。返回 x0 的位（nil="0x0000000000000000"） |
+| **`objcDesc`** | `(hex) → string` | 回读句柄内容：NSString 原文，其他对象 description |
+| `objPtr/lsWorkspace/lsAppList/lsAppInfo/lsOpenURL/lsOpenApp/objCall`（bridge_objc.js） | | LSApplicationWorkspace 驱动套装：枚举已装应用/拉起 App/打开 URL，均无 entitlement 依赖 |
+
+⚠️ 红线：①只适用整型/指针返回（float/struct 返回方法不适用）②经 msgSend 调 alloc/new/copy 族泄漏 +1（ARC 视 msgSend 返回为 +0）③方法实参超过 7 个不支持 ④接收 completion handler(block) 参数的方法不可调。
 
 ### dyld / 符号解析（V2 新增）🟡
 | 原语 | 签名 | 说明 |
@@ -252,6 +263,7 @@ return JSON.stringify(out);
 - `bridge_info.js`：`dumpIdentity()`、`dumpEntitlements()`
 - `bridge_net.js`：`scanCommonPorts(host)`、`httpGet(host,port,path)`、`hexEncode(str)`
 - `bridge_ui.js`：`enumSchemes()`
+- `bridge_objc.js`：`objPtr(hex)`、`lsWorkspace()`、`lsAppList()`、`lsAppInfo(bid)`、`lsOpenURL(url)`、`lsOpenApp(bid)`、`objCall(hex,sel)`
 - `bridge_xpc.js`：`xpcCall(svc,msg,timeout)`、`machScan(names)`、`symResolve(fw,syms)`、`keychainScan(services)`、`sandboxScan(ops)` ｜ `jbV3StructProbe.js`：`zeroStructB64(n)`、`krStr(code)`、`log(...)`
 
 ### ★ 必带：IOReturn 错误码字典（回喂给 AI 时用）
@@ -291,7 +303,7 @@ Keychain、ObjC 运行时 / dlopen、后台常驻监听（iOS 限制，App 必�
 ## 历史与依赖
 
 - 服务实现：`RyConsole/PayloadApp/AutorunServer.{h,m}`（原生，监听 + 极简 HTTP + 任务队列 + 面板）
-- **原生桥完整参考：`RyConsole/PRIMITIVES.md`**（63 个原语的签名/返回值/安全分级/用法示例，比本技能更详细）
+- **原生桥完整参考：`RyConsole/PRIMITIVES.md`**（67 个原语的签名/返回值/安全分级/用法示例，比本技能更详细）
 - 使用说明：`RyConsole/AUTORUN.md` ｜ 协议与后端设计：`RyConsole/AI_BACKEND.md`
 - 安全条款：`RyConsole/DISCLAIMER.md`
 - 改了原生代码（`main.m` 的 `installPrimitives` / `AutorunServer.m`）需重编 IPA；只改 JS 探针无需重编。
