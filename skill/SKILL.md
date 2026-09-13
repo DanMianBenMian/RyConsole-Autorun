@@ -144,7 +144,7 @@ Agent 发来的代码会自动回显到 GUI 编辑区，用户看得见。
 
 1. **`print()` 就是回传通道**：所有中间信息用 `print(...)` 输出，会收在 `output` 里。
 2. **`return` 是结果通道**：最后 `return` 的对象/字符串进 `result`。
-3. 代码里可以直接调用**已注册的原生原语**（52 个，见下节「原生桥清单」）——
+3. 代码里可以直接调用**已注册的原生原语**（63 个，见下节「原生桥清单」）——
    不要凭猜测写 API，**先用清单核对**再写；清单里没有的接口就是没有。
 4. **把结果做成 JSON 字符串再 return**，比返回裸对象更稳（可读、可解析）。
 5. **单步优先**：一轮一件事。跑得越久越容易触发超时和 panic，也更难定位。
@@ -172,7 +172,7 @@ return JSON.stringify(out);
 
 ## 原生桥清单（写在探针前先核对这张表）
 
-**全部 52 个原语**都已注册为全局函数。每次执行都是**全新 JSContext**（跨轮次变量不保留 → 要状态就落盘）。
+**全部 63 个原语**都已注册为全局函数。每次执行都是**全新 JSContext**（跨轮次变量不保留 → 要状态就落盘）。
 安全分级：🟢只读 / 🟡有副作用 / 🔴高危（人工确认）。
 
 ### IOKit 内核接口（核心）🟢
@@ -192,6 +192,31 @@ return JSON.stringify(out);
 
 ### XPC / 服务 🟡
 `xpcLookup(svc)→"REACHABLE"/"NOT_REACHABLE"`、`xpcProbe(svc)`、`xpcSend(svc, selector, payloadJSON)`、`nsxpcProbe(svc)`
+
+### XPC 结构化桥（V2 新增，2026-09-13）🟡
+| 原语 | 签名 | 说明 |
+|---|---|---|
+| **`xpcConn`** | `(svc) → {h}` | 持久连接句柄（事件 handler 已设空块，对端崩溃不会 crash 本进程） |
+| **`xpcSendMsg`** | `(h, msgDict, timeoutSec) → reply对象` | 结构化收发：任意嵌套 JS 对象 → xpc_dictionary；reply 递归解析回 JS 对象（uint64 转 0x 十六进制串防精度丢失；深度限 6、每层限 64）。`timeoutSec<=0` 只发不收 → "SENT"；超时 `{err:"timeout"}` |
+| **`xpcClose`** | `(h) → "ok"` | 关闭并释放 |
+| **`machLookUp`** | `(svc) → {kr, port}` | bootstrap_look_up 原始版：kr=0 成功，port 为 mach 句柄名 |
+| `xpcCall`（bridge_xpc.js） | `(svc, msg, timeoutSec)` | 一次性封装：连接→发→收→关，探针最常用 |
+
+### dyld / 符号解析（V2 新增）🟡
+| 原语 | 签名 | 说明 |
+|---|---|---|
+| **`dlopenFW`** | `(path, mode) → {h}` 或 `{err}` | dlopen 私有框架（path 形如 `/System/Library/PrivateFrameworks/Foo.framework/Foo`） |
+| **`dlsymAddr`** | `(h, name) → {addr:"0x…"}` 或 `{err}` | 符号地址（已含 ASLR slide）；`h=0` 用 RTLD_DEFAULT 全镜像搜索 |
+| `symResolve`（bridge_xpc.js） | `(fwPath, symNames[])` | dlopen+dlsym 一次到位 |
+
+### 沙盒 / 钥匙串 / 进程（V2 新增）🟡
+| 原语 | 签名 | 说明 |
+|---|---|---|
+| **`sandboxCheck`** | `(op) → {ret, errno}` | sandbox_check **原始返回值**（苹果语义模糊，不解读，探针自行比对） |
+| **`keychainProbe`** | `(cls, svc, acct) → {status, exists, stHex}` | SecItem 只查不取不弹框：0=存在可读，-25300=不存在，-34018=缺 entitlement；cls: genp/inet/cert/keys/idnt |
+| **`procListPids`** | `() → {n, pids[]}` | proc_listallpids；沙盒内多 EPERM（错误本身即测量结果） |
+| **`posixSpawn`** | `(path, argvArr, timeoutMs) → {pid, exit/signal/timeout}` | 沙盒内多被拒（spawn 错误码原样回传）；timeoutMs≤30000，超时不 reap（僵尸进程表可见=信号） |
+| `keychainScan` / `sandboxScan` / `machScan`（bridge_xpc.js） | 批量版 | 多 service/op/service-name 一把梭出矩阵 |
 
 ### 网络 🟡
 | 原语 | 签名 | 说明 |
@@ -226,7 +251,8 @@ return JSON.stringify(out);
 - `bridge_iokit.js`：`jbIokitEnum()`、`jbProbeIOKit(...)`、`jbIokitVerdict(...)`、`jbV3Battery()`、`jbV3Report()`、`jbV3MethodCall(...)`
 - `bridge_info.js`：`dumpIdentity()`、`dumpEntitlements()`
 - `bridge_net.js`：`scanCommonPorts(host)`、`httpGet(host,port,path)`、`hexEncode(str)`
-- `bridge_ui.js`：`enumSchemes()` ｜ `jbV3StructProbe.js`：`zeroStructB64(n)`、`krStr(code)`、`log(...)`
+- `bridge_ui.js`：`enumSchemes()`
+- `bridge_xpc.js`：`xpcCall(svc,msg,timeout)`、`machScan(names)`、`symResolve(fw,syms)`、`keychainScan(services)`、`sandboxScan(ops)` ｜ `jbV3StructProbe.js`：`zeroStructB64(n)`、`krStr(code)`、`log(...)`
 
 ### ★ 必带：IOReturn 错误码字典（回喂给 AI 时用）
 
@@ -265,7 +291,7 @@ Keychain、ObjC 运行时 / dlopen、后台常驻监听（iOS 限制，App 必�
 ## 历史与依赖
 
 - 服务实现：`RyConsole/PayloadApp/AutorunServer.{h,m}`（原生，监听 + 极简 HTTP + 任务队列 + 面板）
-- **原生桥完整参考：`RyConsole/PRIMITIVES.md`**（52 个原语的签名/返回值/安全分级/用法示例，比本技能更详细）
+- **原生桥完整参考：`RyConsole/PRIMITIVES.md`**（63 个原语的签名/返回值/安全分级/用法示例，比本技能更详细）
 - 使用说明：`RyConsole/AUTORUN.md` ｜ 协议与后端设计：`RyConsole/AI_BACKEND.md`
 - 安全条款：`RyConsole/DISCLAIMER.md`
 - 改了原生代码（`main.m` 的 `installPrimitives` / `AutorunServer.m`）需重编 IPA；只改 JS 探针无需重编。
