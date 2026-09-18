@@ -203,6 +203,14 @@ jid = json.loads(urllib.request.urlopen(req, timeout=25).read())["id"]   # 然�
 | 自解释串 | `memRead(h,0)` → `[memRead error] len must be 1..65536`<br>`sysctlGet("")` → `[sysctlGet error] name must be a non-empty string…` | 照它改参数 |
 | 结构化 | `iokitMap(0,0)` → `{ok:false, error:"[iokitMap error] conn must be a handle…", hint:"…"}` | `error`=是什么，`hint`=下一步 |
 | 裸码 | `iokitOpen("Foo")` → `-2`；`iokitCall(...).ret` → `0xe00002c2` | **先 `krWhy(kr)` / `machKrWhy(kr)`** 再判断 |
+| **类型错** | `iosurfaceCreate("x")` → `[iosurfaceCreate error] props must be an object/dictionary (可省略), got string("x")  \|  签名: … \|  查参数: primHelp("iosurfaceCreate")` | 由 **`bridge_guard.js`** 在进入原生前拦住 |
+
+**★ 为什么会有"类型错"这一档（V2.2.5 新增）**：原生桥的 block 参数是强类型的（`NSDictionary*`/`NSString*`/`NSNumber*`…）。
+JS 侧传错类型时，**JavaScriptCore 会在进入原生校验之前就抛英文 `TypeError`**（例：`Cannot convert primitive to NSDictionary`），
+我们的中文错误根本没机会跑。`bridge_guard.js` 在加载时给 33 个原语套一层类型守卫（纯 JS，**热更新即生效**），
+把这种错误换成带「参数名 + 期望类型 + 实际类型 + 签名 + primHelp 指引」的自解释串。
+> 通用技巧：**桥脚本可以覆盖原生全局**（`main.m` 里那层"点名"包装就是这么干的），
+> 所以参数校验、类型守卫这类"外壳逻辑"放 JS 层 → 不用重编 IPA 就能修。
 
 **在设备上直接查文档（不用翻这份文件、也不用到仓库里找 PRIMITIVES.md）**：
 ```js
@@ -216,6 +224,11 @@ iokitMapTry(conn)       // 扫 memType 0..15，给"哪个可用/都不支持"的
 
 > ⚠️ 旧版 §11 IOReturn 字典**整张是错的**（名字与 hex 错位）。下表已按 `IOKitReturn.h` 重新生成，
 > 并用真机实测交叉验证过 3 个码：`-536870206`=BadArgument、`-536870202`=BadMessageID、`-536870174`=NotPermitted。
+>
+> **★ 同一张错表还藏在 V3 探针里（V2.2.5 已修，读旧结论要注意）**：`jbV3StructProbe.js` 的 `KR` 表同样错位，
+> 且错得危险 —— `0xe00002e2` 旧标 **NotPrivileged**（实为 **NotPermitted = 沙盒门禁**）、
+> `0xe00002c7` 旧标 NotReadable（实为 Unsupported）、`0xe00002d2` 旧标 Unsupported（实为 StillOpen）。
+> 该探针现在 `krStr()` 改为**优先调用 `krWhy()`**（单一事实源）。**凡是用旧版探针输出得出的 kr 语义结论，都要用 `krWhy()` 复核一遍。**
 
 | 现象 | 原因 | 处置 |
 |---|---|---|
@@ -232,11 +245,14 @@ iokitMapTry(conn)       // 扫 memType 0..15，给"哪个可用/都不支持"的
 
 1. **`print()` 就是回传通道**：所有中间信息用 `print(...)` 输出，会收在 `output` 里。
 2. **`return` 是结果通道**：最后 `return` 的对象/字符串进 `result`。
-3. 代码里可以直接调用**已注册的原生原语**（68 个，见下节「原生桥清单」）——
+3. **探针首行写不写注释都行**（可选）。写的好处：人若正好在看 iPad 的「收到的代码」面板，一眼知道这条在干嘛；
+   批量跑多探针时（`// [7/19][JS] iokitMapTry 参数校验`）尤其有用。**单条快探针不必强加** —— 用户明确说过"不一定有人看"，
+   别为了形式加一堆。真正硬性的只有：`output` 里能看懂、`return` 是结果。
+4. 代码里可以直接调用**已注册的原生原语**（68 个，见下节「原生桥清单」）——
    不要凭猜测写 API，**先用清单核对**再写；清单里没有的接口就是没有。
-4. **把结果做成 JSON 字符串再 return**，比返回裸对象更稳（可读、可解析）。
-5. **单步优先**：一轮一件事。跑得越久越容易触发超时和 panic，也更难定位。
-6. **返回值尽量小**：不要 return 巨大的结构，超长输出用 `print` 分段。
+5. **把结果做成 JSON 字符串再 return**，比返回裸对象更稳（可读、可解析）。
+6. **单步优先**：一轮一件事。跑得越久越容易触发超时和 panic，也更难定位。
+7. **返回值尽量小**：不要 return 巨大的结构，超长输出用 `print` 分段。
 
 ### 推荐模板
 
@@ -364,6 +380,26 @@ if (inst.ok) {
 
 ### 桥库函数（`RyConsoleScripts/*.js`，随 bundle 加载）
 - `bridge_iokit.js`：`jbIokitEnum()`、`jbProbeIOKit(...)`、`jbIokitVerdict(...)`、`jbV3Battery()`、`jbV3Report()`、`jbV3MethodCall(...)`、**`iokitMapTry(conn,types?)`**、**`krName/krHex/krWhy/krHint`**
+- **`bridge_guard.js`（V2.2.5 新增）**：`installGuards()` —— 给 33 个原语套**类型参数守卫**，把 JSC 英文 `TypeError` 换成自解释串（热更新即生效，不用重编）
+
+### ★ 装桥 / 改桥：一条命令（V2.2.5，不用重编 IPA）
+
+桥是动态层：**Documents 的同名文件优先于包内默认**。所以改桥 = 写进 Documents。
+用 `RyConsole/tools/ryc_bridge.py`（纯标准库）：
+
+```bash
+python tools/ryc_bridge.py <iPadIP> list         # 谁在用 Documents 覆盖 / 谁用包内默认 / 两边字节数
+python tools/ryc_bridge.py <iPadIP> versions     # ★ 设备上**实际加载**的每个桥版本（各桥自报 RYC_BRIDGES）
+python tools/ryc_bridge.py <iPadIP> push bridge_xpc.js     # 装/改单个桥（写完回读校验字节数）
+python tools/ryc_bridge.py <iPadIP> pushall                # 本地 RyConsoleScripts/*.js 全推
+python tools/ryc_bridge.py <iPadIP> get bridge_objc.js     # 把设备当前生效源码拉回来（含包内默认）
+python tools/ryc_bridge.py <iPadIP> rm bridge_xpc.js       # 删覆盖 → 回落包内默认
+python tools/ryc_bridge.py <iPadIP> check                  # 总览：连通/覆盖数/版本/崩溃日志大小
+```
+
+**排查"改了没生效"就靠这三条**：`versions`（在跑哪版）→ `list`（有没有 Documents 覆盖、和包内差多少）→ `get`（把设备上真正在跑的那份拉回来比对）。
+
+**约定**：每个桥顶部 `var BRIDGE_VERSION="vX.Y (build YYYY-MM-DD)"` + `RYC_BRIDGES["bridge_x"]=BRIDGE_VERSION;` + 末尾 `print("[bridge_x] 已加载: …")`。缺版本号就无法判断设备跑的是哪版（V2.2.5 已把 8 个桥全补齐）。
 - **`bridge_help.js`（V2.2.4 新增）**：**`primHelp(过滤词?)`**、**`primErrors()`**、**`primMissing()`** —— 设备上的原语说明书，写探针前先问它
 - `bridge_info.js`：`dumpIdentity()`、`dumpEntitlements()`
 - `bridge_net.js`：`scanCommonPorts(host)`、`httpGet(host,port,path)`、`hexEncode(str)`
