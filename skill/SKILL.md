@@ -6,6 +6,9 @@ description: >-
   典型触发：「在 iPad 上跑这段 JS」「用 RyConsole 执行」「真机验证这个探针」「把结果传回来看」。
   内置轮询契约：提交后每 3 秒查一次结果、最多 12 次；并含全部实踩坑点（连不上的四要素、
   面板必须先启动、V2.2 起监听期自带后台保活（可切后台/锁屏）、print 捕获语义、轮询未完成的判定与处置）。
+  ★ 关键坑（v1.0 实测）：提交必须用 JSON body（form 分支不做 percent-decode，会静默失败）、
+  job 只活 ~36s（超时变 404 而非报错）、`lsAppList()` 一次调用即崩进程、服务单线程（并发必坏）。
+  ★ 若官方 exe 只报 `unknown job`，改用直连客户端 `ryc.py` 看服务端原始响应。
 agent_created: true
 ---
 
@@ -130,7 +133,89 @@ Agent 发来的代码会自动回显到 GUI 编辑区，用户看得见。
   确认 App 是否被系统回收（保活态的灵动岛/锁屏应仍显示「监听中」）、是否弹了系统弹窗（如局域网权限），
   必要时把代码拆小分步跑，或让用户重新点「启动监听」。
 
+## ★ 提交与轮询的硬约束（v1.0 实测，2026-09-18）
+
+服务端真实 API：
+
+```
+POST /submit   Content-Type: application/json   body: {"code":"<js>"}     (form/裸 JS 也支持)
+               -> {"ok":true,"id":"j<session>-N","status":"accepted",
+                   "pollIntervalMs":3000,"maxPolls":12,"jobTtlSec":300,"srcKind":"json"}
+GET  /result?id=jN   -> {status, result, output, id, ms, ok, error, codeLen, srcKind, ts}
+                        （过期 -> {"error":"job_expired","hint":...}；无此 id -> "unknown_job"）
+GET  /ping           -> {ok, port, lanIP, jobs, busy, version, running,
+                         hits, pid, session, lastCodeLen, lastCodeHead, lastSrcKind, lastPrim, jobTtlSec}
+```
+
+| # | 约束 | 症状 | 处置 |
+|---|---|---|---|
+| 1 | JSON body（**V2.2.2 起 form 也支持**） | 老版 form 分支不做 percent-decode：`%22`/`%28` 被当字面量送进 `new Function()` → SyntaxError 且 `ok:true`（完全静默）。**V2.2.2 已修**（完整 percent-decode + `srcKind` 标记；body 不像 form 就当裸 JS） | 仍推荐 `json.dumps({"code": code})` + `Content-Type: application/json` |
+| 2 | job 保留 **300s**（V2.2.2 起） | 老版只活 ~36s，过期返裸 404。现在过期返 `{"error":"job_expired","hint":...}`（HTTP 200），`unknown_job` 才是真没这个 id | 长任务仍建议拆多轮；查 `/ping` 的 `jobTtlSec` |
+| 3 | 服务单线程（V2.2.2 起 busy 返 **429**） | 并发 `POST /eval` → 后到的原本会被断连（`RemoteDisconnected`）。现在返回 `429 + retryAfterMs` | **仍要串行**：一次一个探针；长活走 `/submit` |
+| 4 | 异常带 name+message+stack（V2.2.2 起） | 老版只留一行被截断的 stack，`error` 还是 null | 现在 `error` 字段有完整异常；自己包 try/catch 依然更稳 |
+| 5 | `jobs` 计数会跳变、重启后 id 带会话前缀（`j<session>-<n>`） | 旧 id 查不到 | 别缓存 id 跨请求复用；`/ping` 的 `session`/`pid` 变化即"服务重启过" |
+
+### 直连客户端（官方 exe 掩盖错误时用）
+
+官方 `ryc_autorun.exe` 在 job 过期时统一报 `unknown job`，看不到服务端原始响应。备一个直连客户端：
+
+```bash
+python ryc.py <iPadIP> 8899 <probe.js>     # stderr 打印 /ping /submit 原始响应，stdout 打印完整 job 结果
+```
+
+关键实现（10 行）：
+```python
+body = json.dumps({"code": code}).encode("utf-8")
+req = urllib.request.Request(f"http://{h}:{p}/submit", data=body, method="POST")
+req.add_header("Content-Type", "application/json")
+jid = json.loads(urllib.request.urlopen(req, timeout=25).read())["id"]   # 然后轮询 /result?id=
+```
+
+### 崩溃桥黑名单（v1.0 实测 → **V2.2.3 已修**）
+
+| 桥 | v1.0 | V2.2.3 起 | 说明 |
+|---|---|---|---|
+| **`lsAppList()`** | ❌ 必崩 | ✅ **可用**（分页） | 老版一次调用即进程重启（pid 差分实证）。**根因**见下。现改为 `lsAppList(offset, limit)`（默认 120 / 上限 200）+ `lsAppCount()` / `lsAppListInfo()`，返回 bundleID 字符串数组 |
+| **`objc_msgSend` / `objc_msgSendSafe` 调标量-返回 selector** | ❌ 必崩 | ✅ 可用 | `count`/`length`/`intValue`/`isEqual:` 这类现在能直接调，返回值就是整数的十六进制串 |
+| `objc_getClass` / `sel_registerName` / `objcDesc` | ✅ | ✅ | `objcDesc` 新增指针体检：把标量当对象传进来会返回提示串而不是崩 |
+| `iokitOpen` / `iosurfaceProbe` / `lsWorkspace` / `memRead` / `objPtr` | ✅ | ✅ | 可放心用（`memRead` 只读本进程映射） |
+| `openAutorunPanel()` | ❌ 必崩 | ✅ 可用 | 它从 **Autorun 连接线程（后台）** 读 keyWindow + present 视图 = 后台碰 UI → 段错误。已改为切主线程（返回 `OK:queued-on-main`） |
+| `iokitMap` | ❓ | ✅ 用法明确 | **签名早已确定**：`iokitMap(conn, memType)`（就是 `IOConnectMapMemory64(conn, memType, mach_task_self(), …, kIOMapAnywhere)`）。一直回 `kIOReturnBadArgument` **不是签名问题**，而是多数 UserClient 没实现 `clientMemoryForType`。V2.2.4 起失败会给 `{ok:false, error, hint}`，并可用 **`iokitMapTry(conn)`** 扫 0..15 一次定论 |
+
+> **崩溃根因（2026-09-18，安全研究 AI 源码级定位，已在 V2.2.3 修复）**：
+> `main.m` 的 `objcMsgSendNative` / `objcMsgSendSafeNative` 用 `id ret = nil;` 接 `objc_msgSend` 返回值。
+> ARC 下 `id` 是 `__strong`，**赋值即插入 `objc_retain()`**；当 selector 返回**标量**（如 `count` 返回 `0x1f`）时，
+> `objc_retain(0x1f)` 去解引用非法地址 → **SIGSEGV**（信号级，`@try/@catch` 抓不到，所以表现为"一次调用即重启"）。
+> 修法：**`__unsafe_unretained id ret`**（两处，各一行）。
+>
+> 定位手段（可复用）：① `readFile("ryconsole_crash.log")` 取栈（V2.2.1 起自动记录）；
+> ② **pid 差分**：ping 拿 `pid` → 发探针 → 再 ping；pid 变了就是这条探针把进程打崩了（`/ping` 现带 `pid`/`session`）；
+> ③ V2.2.2 起崩溃日志与 `/ping` 还带 **`lastPrim`**（崩溃时正在执行哪个原语），可直接点名。
+
 ## 报错处置表
+
+### 错误自解释约定（V2.2.4 起，Bug6 修复）
+
+**判据一句话：字符串里出现 `] error]` 就是错误**，不用猜。
+
+| 形态 | 例子 | 怎么读 |
+|---|---|---|
+| 自解释串 | `memRead(h,0)` → `[memRead error] len must be 1..65536`<br>`sysctlGet("")` → `[sysctlGet error] name must be a non-empty string…` | 照它改参数 |
+| 结构化 | `iokitMap(0,0)` → `{ok:false, error:"[iokitMap error] conn must be a handle…", hint:"…"}` | `error`=是什么，`hint`=下一步 |
+| 裸码 | `iokitOpen("Foo")` → `-2`；`iokitCall(...).ret` → `0xe00002c2` | **先 `krWhy(kr)` / `machKrWhy(kr)`** 再判断 |
+
+**在设备上直接查文档（不用翻这份文件、也不用到仓库里找 PRIMITIVES.md）**：
+```js
+primHelp()              // 全部原语速查（标 ✅自解释 / ⚠裸码）
+primHelp("iokitMap")    // 单个：参数名+类型+合法范围+返回+常见错误
+primErrors()            // 错误约定机读版
+primMissing()           // 还欠自解释的桥（诚实清单）
+krWhy(-536870206)       // "kIOReturnBadArgument (0xe00002c2) — 参数形状被拒…"
+iokitMapTry(conn)       // 扫 memType 0..15，给"哪个可用/都不支持"的定论
+```
+
+> ⚠️ 旧版 §11 IOReturn 字典**整张是错的**（名字与 hex 错位）。下表已按 `IOKitReturn.h` 重新生成，
+> 并用真机实测交叉验证过 3 个码：`-536870206`=BadArgument、`-536870202`=BadMessageID、`-536870174`=NotPermitted。
 
 | 现象 | 原因 | 处置 |
 |---|---|---|
@@ -181,11 +266,11 @@ return JSON.stringify(out);
 ### IOKit 内核接口（核心）🟢
 | 原语 | 签名 | 说明 |
 |---|---|---|
-| `iokitEnum` | `() → string` | 枚举 IORegistry 服务（JSON） |
-| `iokitOpen` | `(cls, type) → number` | 打开 IOService；**>0 成功** |
-| `iokitCall` | `(conn, sel, inputs[]) → string` | 标量入参调用 |
-| `iokitCallStruct` | `(conn, sel, scalarInputs[], structB64, outSize) → string` | 带 inputStruct / OOL 输出 |
-| `iokitMap` | `(conn, mapType) → string` | 内存映射 |
+| `iokitEnum` | `() → string[]` | 枚举 IORegistry 服务类名 |
+| `iokitOpen` | `(cls, type) → number` | 打开 IOService；**>0 成功**。`-2` 类不存在 / `-3` 类名为空 / `-536870174` 门禁 |
+| `iokitCall` | `(conn, sel, inputs[]) → {ret,outputs,ok,error?}` | 标量入参（≤16；非数字项会被忽略并在 `note` 点名） |
+| `iokitCallStruct` | `(conn, sel, scalarInputs[], structB64, outSize) → {ret,outputs,outStruct,ok}` | 带 inputStruct / OOL 输出；`outSize` 合法 1..65536 |
+| `iokitMap` | `(conn, memType) → {ret,ok,addr?,size?,error?,hint?}` | 内存映射。**失败自带原因+建议**（V2.2.4）；memType 不确定先 `iokitMapTry(conn)` |
 | `iokitClose` | `(conn) → number` | 关闭 |
 | `bytesB64` / `b64Bytes` | `(arr)/ (b64)` | 字节 ↔ base64 |
 
@@ -212,15 +297,16 @@ return JSON.stringify(out);
 | **`sel_registerName`** | `(name) → "0x…"` | SEL 句柄（永生） |
 | **`objc_msgSend`** | `(recv, sel, args) → "0x…"` | 万能调用。recv=0x 句柄(0=nil)；sel=名字(自动注册)或 0x 句柄；args 规则：字符串→自动包 NSString、数字→uint64 位槽(BOOL/int/long 位传)、`{hex:"0x.."}`→原始指针、null→nil。返回 x0 的位（nil="0x0000000000000000"） |
 | **`objcDesc`** | `(hex) → string` | 回读句柄内容：NSString 原文，其他对象 description |
-| `objPtr/lsWorkspace/lsAppList/lsAppInfo/lsOpenURL/lsOpenApp/objCall`（bridge_objc.js） | | LSApplicationWorkspace 驱动套装：枚举已装应用/拉起 App/打开 URL，均无 entitlement 依赖 |
+| `objPtr/lsWorkspace/lsAppInfo/lsOpenURL/lsOpenApp/objCall`（bridge_objc.js） | | LSApplicationWorkspace 驱动套装：单点查询 / 拉起 App / 打开 URL，均无 entitlement 依赖 |
+| ❌ **`lsAppList()`** | | **v1.0 实测：一次调用即崩进程**（pid 2078→2099→2102 差分实证）。批量枚举已装应用是雷区，改用 `lsAppInfo('<bundleID>')` 单点查询 |
 
 ⚠️ 红线：①只适用整型/指针返回（float/struct 返回方法不适用）②经 msgSend 调 alloc/new/copy 族泄漏 +1（ARC 视 msgSend 返回为 +0）③方法实参超过 7 个不支持 ④接收 completion handler(block) 参数的方法不可调。
 
 ### ObjC 安全封装 + 读映射内存（V2.2 新增，2026-09-18）🔴
 | 原语 | 签名 | 说明 |
 |---|---|---|
-| **`objc_msgSendSafe`** | `(recv, sel, args[]) → JSON` | **优先用这个**：返回 `{"ok":true,"value":"0x…"}` / `{"ok":false,"error":"…"}`。nil 接收者、坏 selector、参数 >7 都变成可读错误，而不是静默返回 0x0 或崩 |
-| **`memRead`** | `(hex, len) → hex string` | 读该指针处的**本进程映射内存**（len ≤ 65536）。拿到 `objc_msgSend` 返回的句柄后 dump 对象 / C 结构体用；越界或未映射返回 `[memRead error] vm_read kr=…`，不崩 |
+| **`objc_msgSendSafe`** | `(recv, sel, args[]) → JSON` | 返回 `{"ok":true,"value":"0x…"}` / `{"ok":false,"error":"…"}`。nil 接收者、坏 selector、参数 >7 都变成可读错误。⚠️ **但它并没有修掉崩溃根因**：源码 `main.m` 里它和裸版一样用 `id ret` 接收返回值 → **任何返回整数的 selector（`count`/`length`/`intValue`/`isEqual:`…）都会被 ARC 当对象指针 retain/release → SIGSEGV**（`@try/@catch` 抓不到信号）。**在修复前，调 objc 桥只挑"确定返回对象 id"的 selector**（如 `defaultWorkspace`、`objectAtIndex:`），避开一切返回标量的 |
+| **`memRead`** | `(hex_addr, len) → hex string` | 读 **本进程地址空间**（实现是 `vm_read(mach_task_self(), …)`，main.m 注释明说"只对本进程地址空间有效"）。`len ∈ [1, 65536]`。签名由错误信息自解释：`memRead()`→`[memRead error] null address`；`memRead(h)`→`[memRead error] len must be 1..65536`；越界/未映射→`[memRead error] vm_read kr=N`。实测 `memRead(lsWorkspace(), 64)` 能读出真实 objc 对象头（isa 带 PAC 签名 `0x01000002_0604dd59`）→ **真实读非回显**。⚠️ **它不是内核读原语**：读内核地址只会返回 `kr=2`（KERN_INVALID_ADDRESS），不崩也读不到 |
 
 ```js
 var WS   = objc_getClass("LSApplicationWorkspace");
@@ -277,31 +363,41 @@ if (inst.ok) {
 | `require("bridge_x.js")` | 动态加载桥库（改 JS 不用重编 IPA） |
 
 ### 桥库函数（`RyConsoleScripts/*.js`，随 bundle 加载）
-- `bridge_iokit.js`：`jbIokitEnum()`、`jbProbeIOKit(...)`、`jbIokitVerdict(...)`、`jbV3Battery()`、`jbV3Report()`、`jbV3MethodCall(...)`
+- `bridge_iokit.js`：`jbIokitEnum()`、`jbProbeIOKit(...)`、`jbIokitVerdict(...)`、`jbV3Battery()`、`jbV3Report()`、`jbV3MethodCall(...)`、**`iokitMapTry(conn,types?)`**、**`krName/krHex/krWhy/krHint`**
+- **`bridge_help.js`（V2.2.4 新增）**：**`primHelp(过滤词?)`**、**`primErrors()`**、**`primMissing()`** —— 设备上的原语说明书，写探针前先问它
 - `bridge_info.js`：`dumpIdentity()`、`dumpEntitlements()`
 - `bridge_net.js`：`scanCommonPorts(host)`、`httpGet(host,port,path)`、`hexEncode(str)`
 - `bridge_ui.js`：`enumSchemes()`
-- `bridge_objc.js`：`objPtr(hex)`、`lsWorkspace()`、`lsAppList()`、`lsAppInfo(bid)`、`lsOpenURL(url)`、`lsOpenApp(bid)`、`objCall(hex,sel)`
-- `bridge_xpc.js`：`xpcCall(svc,msg,timeout)`、`machScan(names)`、`symResolve(fw,syms)`、`keychainScan(services)`、`sandboxScan(ops)` ｜ `jbV3StructProbe.js`：`zeroStructB64(n)`、`krStr(code)`、`log(...)`
+- `bridge_objc.js`：`objPtr(hex)`、`lsWorkspace()`、`lsAppList(offset,limit)`、`lsAppCount()`、`lsAppListInfo()`、`lsAppInfo(bid)`、`lsOpenURL(url)`、`lsOpenApp(bid)`、`objCall(hex,sel)`
+- `bridge_xpc.js`：`xpcCall(svc,msg,timeout)`、`machScan(names)`、`symResolve(fw,syms)`、`keychainScan(services)`、`sandboxScan(ops)`、**`machKrWhy(kr)`** ｜ `jbV3StructProbe.js`：`zeroStructB64(n)`、`krStr(code)`、`log(...)`
 
 ### ★ 必带：IOReturn 错误码字典（回喂给 AI 时用）
 
 ```js
-var IORETURN = {
-  "0": "kIOReturnSuccess",
-  "-536870174": "kIOReturnNotPermitted",   // 0xe00002e2 门禁 -> 别重试，换策略
-  "-536870163": "kIOReturnUnsupported",    // 0xe00002bc selector 不存在 -> 换 selector
-  "-536870206": "kIOReturnBadArgument",    // 0xe00002c7 入参不对
-  "-536870203": "kIOReturnNotOpen",
-  "-536870195": "kIOReturnNotFound",
-  "-536870201": "kIOReturnNoResources",
-  "-536870212": "kIOReturnNotPrivileged",  // 缺 entitlement
-  "-536870199": "kIOReturnExclusiveAccess",
-  "-536870211": "kIOReturnTimeout"
+// 建议直接用桥里的 krWhy(kr) / krName(kr) / krHint(kr)（bridge_iokit.js）
+var IOKIT_KR_HEX = {
+  "e00002bc": "kIOReturnError",            "e00002bd": "kIOReturnNoMemory",
+  "e00002be": "kIOReturnNoResources",      "e00002bf": "kIOReturnIPCError",
+  "e00002c0": "kIOReturnNoDevice",         "e00002c1": "kIOReturnNotPrivileged",
+  "e00002c2": "kIOReturnBadArgument",      "e00002c3": "kIOReturnLockedRead",
+  "e00002c4": "kIOReturnLockedWrite",      "e00002c5": "kIOReturnExclusiveAccess",
+  "e00002c6": "kIOReturnBadMessageID",     "e00002c7": "kIOReturnUnsupported",
+  "e00002c8": "kIOReturnVMError",          "e00002c9": "kIOReturnInternalError",
+  "e00002ca": "kIOReturnIOError",          "e00002cc": "kIOReturnCannotLock",
+  "e00002cd": "kIOReturnNotOpen",          "e00002ce": "kIOReturnNotReadable",
+  "e00002cf": "kIOReturnNotWritable",      "e00002d0": "kIOReturnNotAligned",
+  "e00002d1": "kIOReturnBadMedia",         "e00002d2": "kIOReturnStillOpen",
+  "e00002d5": "kIOReturnBusy",             "e00002d6": "kIOReturnTimeout",
+  "e00002d8": "kIOReturnNotReady",         "e00002da": "kIOReturnNoChannels",
+  "e00002db": "kIOReturnNoSpace",          "e00002e2": "kIOReturnNotPermitted",
+  "e00002e6": "kIOReturnUnsupportedMode",  "e00002eb": "kIOReturnAborted",
+  "e00002f0": "kIOReturnNotFound"
 };
+// 常用有符号值：BadArgument -536870206 / BadMessageID -536870202 / Unsupported -536870201 /
+//              NotPrivileged -536870207 / NotPermitted -536870174 / NotOpen -536870195 / NoSpace -536870181
 function kr(c) {
   var n = (typeof c === "string" && /^0x/i.test(c)) ? parseInt(c, 16) : Number(c);
-  return IORETURN[String(n)] || ("unknown(" + c + ")");
+  return IOKIT_KR_HEX[((n >>> 0).toString(16)).padStart(8, "0")] || ("unknown(" + c + ")");
 }
 ```
 
@@ -320,7 +416,9 @@ function kr(c) {
 
 ### 没有的能力（别浪费时间找）
 `setTimeout/setInterval`（用 `sleep`）、跨执行保留变量（落盘）、返回 `float`/`struct` 的方法（msgSend 只取整型/指针寄存器）、
-block 参数方法、开放 Keychain 明文（`keychainProbe` 只做读探测）、内核内存 / 页表（`memRead` 只能读本进程映射）、永久后台常驻（保活是"极大延长"不是豁免）。
+block 参数方法、开放 Keychain 明文（`keychainProbe` 只做读探测）、
+**内核内存 / 页表**（`memRead` 实现是 `vm_read(mach_task_self())`，只能读**本进程**映射；读内核地址返回 `kr=2` KERN_INVALID_ADDRESS —— 不崩，但也读不到）、
+永久后台常驻（保活是"极大延长"不是豁免）。
 
 ## 安全红线（不可由被执行的代码自行决定）
 
