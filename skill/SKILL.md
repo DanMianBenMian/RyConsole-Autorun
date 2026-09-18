@@ -191,6 +191,15 @@ jid = json.loads(urllib.request.urlopen(req, timeout=25).read())["id"]   # 然�
 > 定位手段（可复用）：① `readFile("ryconsole_crash.log")` 取栈（V2.2.1 起自动记录）；
 > ② **pid 差分**：ping 拿 `pid` → 发探针 → 再 ping；pid 变了就是这条探针把进程打崩了（`/ping` 现带 `pid`/`session`）；
 > ③ V2.2.2 起崩溃日志与 `/ping` 还带 **`lastPrim`**（崩溃时正在执行哪个原语），可直接点名。
+>
+> **★ V2.2.6 崩溃兜底改变了 ②**：探针触发的**用户态信号崩溃**（SIGSEGV/SIGBUS/…）不再重启进程 ——
+> 本次执行以「触发崩溃，已兜底」返回，App 存活。所以：
+> - **兜底开着时 pid 差分失效**（pid 不再变）→ 改看 `/eval` 返回的 **`guarded:true`** + `guardSignal/guardAddr/guardPrim`，
+>   或 `/ping` 的 `guardHits / guardLastPrim / guardDegraded`；
+> - **`guarded:true` = 这条代码确实会崩**（有价值的结论：找到了真实崩溃面），只是被拦了 —— **别当普通失败重试**；
+> - 被拦下的那次执行状态可能不干净（`guardDegraded:true`），后续行为诡异就**重启 App 复位**；
+> - 想真崩（验证崩溃本身 / 用 pid 差分）：探针里 `crashGuardSet(0)`，跑完 `crashGuardSet(1)`；
+> - 边界：❌ 内核 panic（IOKit 内核侧 → 设备重启，用户态无解，且崩溃日志通常来不及写）❌ 看门狗卡死 ❌ 非布点线程。
 
 ## 报错处置表
 
