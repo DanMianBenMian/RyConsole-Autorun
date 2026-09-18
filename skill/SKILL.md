@@ -5,7 +5,7 @@ description: >-
   当需要在真机 iPad 上跑 iOS 探针 / IOKit 调用 / 沙盒能力测试 / 执行任意 JS 并拿到输出与返回值时使用。
   典型触发：「在 iPad 上跑这段 JS」「用 RyConsole 执行」「真机验证这个探针」「把结果传回来看」。
   内置轮询契约：提交后每 3 秒查一次结果、最多 12 次；并含全部实踩坑点（连不上的四要素、
-  面板必须先启动、App 必须前台、print 捕获语义、轮询未完成的判定与处置）。
+  面板必须先启动、V2.2 起监听期自带后台保活（可切后台/锁屏）、print 捕获语义、轮询未完成的判定与处置）。
 agent_created: true
 ---
 
@@ -29,7 +29,7 @@ AI（电脑端 / Ryan）  ── 写 JS ──▶  RyConsole（iPad，Autorun �
 |---|---|
 | iPad 上 Autorun 已启动 | 应用内打开面板点「启动」，或在控制台执行 `autorunStart(8899)`；面板顶部会显示本机 IP |
 | iPad 与电脑同一局域网 | 电脑 `ping <iPadIP>` 能通 |
-| **RyConsole 保持在前台** | iOS 后台会挂起监听，锁屏/切后台都会断 |
+| RyConsole 处于**保活态** | V2.2 起点「启动监听」后自动保活（静音音频 + 后台任务续期）→ **可切后台 / 锁屏**；面板提示应为「● 正在监听 · 后台保活已开」，灵动岛/锁屏显示「监听中」。若面板显示未启动就是没开 |
 | 端口一致 | 默认 `8899`（面板里可改） |
 
 **先跑 `ping` 确认，再谈执行。** ping 不通时不要盲目重试，按下面报错表处理。
@@ -127,13 +127,14 @@ Agent 发来的代码会自动回显到 GUI 编辑区，用户看得见。
 - `ok:false` 且 `error` 有内容 → **代码本身报错了**（不是通信问题），读 `error` 改代码。
 - `error` 里出现 `[JS Error]` 前缀 → 该行是 JS 异常，可能与 `output` 交错，注意区分。
 - `status:"running"` 跑满 12 次 → 说明代码还没跑完（或卡住）。**不要无脑重试**：先让用户看 iPad 屏幕，
-  确认 App 是否还在前台、是否弹了系统弹窗（如局域网权限），必要时把代码拆小分步跑。
+  确认 App 是否被系统回收（保活态的灵动岛/锁屏应仍显示「监听中」）、是否弹了系统弹窗（如局域网权限），
+  必要时把代码拆小分步跑，或让用户重新点「启动监听」。
 
 ## 报错处置表
 
 | 现象 | 原因 | 处置 |
 |---|---|---|
-| `连不上 ... WinError 10060` / 超时 | 服务没启动 / 不同网段 / App 在后台 | 让用户①开面板点启动 ②确认同一 Wi-Fi ③把 RyConsole 切到前台 |
+| `连不上 ... WinError 10060` / 超时 | 服务没启动 / 不同网段 / 保活被系统回收 | 让用户①开面板点启动 ②确认同一 Wi-Fi ③看灵动岛是否还在显示「监听中」，不在就重点启动 |
 | `连不上 ... 10061 拒绝` | 端口不对或服务已停 | 核对端口；面板里看「● 正在监听」 |
 | `HTTP 404 no such route` | 端点拼错 | 只用 `/ping` `/eval` `/submit` `/result` |
 | `执行器未注册` | 原生侧 `RYAutorunSetEval` 没跑到 | 让用户先在控制台跑任意一段 JS（会触发注册），再启动 Autorun |
@@ -144,7 +145,7 @@ Agent 发来的代码会自动回显到 GUI 编辑区，用户看得见。
 
 1. **`print()` 就是回传通道**：所有中间信息用 `print(...)` 输出，会收在 `output` 里。
 2. **`return` 是结果通道**：最后 `return` 的对象/字符串进 `result`。
-3. 代码里可以直接调用**已注册的原生原语**（67 个，见下节「原生桥清单」）——
+3. 代码里可以直接调用**已注册的原生原语**（68 个，见下节「原生桥清单」）——
    不要凭猜测写 API，**先用清单核对**再写；清单里没有的接口就是没有。
 4. **把结果做成 JSON 字符串再 return**，比返回裸对象更稳（可读、可解析）。
 5. **单步优先**：一轮一件事。跑得越久越容易触发超时和 panic，也更难定位。
@@ -172,7 +173,7 @@ return JSON.stringify(out);
 
 ## 原生桥清单（写在探针前先核对这张表）
 
-**全部 67 个原语**都已注册为全局函数。每次执行都是**全新 JSContext**（跨轮次变量不保留 → 要状态就落盘）。
+**全部 68 个原语**都已注册为全局函数。每次执行都是**全新 JSContext**（跨轮次变量不保留 → 要状态就落盘）。
 安全分级：🟢只读 / 🟡有副作用 / 🔴高危（人工确认）。
 
 ### IOKit 内核接口（核心）🟢
@@ -212,6 +213,21 @@ return JSON.stringify(out);
 | `objPtr/lsWorkspace/lsAppList/lsAppInfo/lsOpenURL/lsOpenApp/objCall`（bridge_objc.js） | | LSApplicationWorkspace 驱动套装：枚举已装应用/拉起 App/打开 URL，均无 entitlement 依赖 |
 
 ⚠️ 红线：①只适用整型/指针返回（float/struct 返回方法不适用）②经 msgSend 调 alloc/new/copy 族泄漏 +1（ARC 视 msgSend 返回为 +0）③方法实参超过 7 个不支持 ④接收 completion handler(block) 参数的方法不可调。
+
+### ObjC 安全封装 + 读映射内存（V2.2 新增，2026-09-18）🔴
+| 原语 | 签名 | 说明 |
+|---|---|---|
+| **`objc_msgSendSafe`** | `(recv, sel, args[]) → JSON` | **优先用这个**：返回 `{"ok":true,"value":"0x…"}` / `{"ok":false,"error":"…"}`。nil 接收者、坏 selector、参数 >7 都变成可读错误，而不是静默返回 0x0 或崩 |
+| **`memRead`** | `(hex, len) → hex string` | 读该指针处的**本进程映射内存**（len ≤ 65536）。拿到 `objc_msgSend` 返回的句柄后 dump 对象 / C 结构体用；越界或未映射返回 `[memRead error] vm_read kr=…`，不崩 |
+
+```js
+var WS   = objc_getClass("LSApplicationWorkspace");
+var inst = JSON.parse(objc_msgSendSafe(WS, "defaultWorkspace", []));   // {ok:true, value:"0x…"}
+if (inst.ok) {
+  print("desc: " + objcDesc(inst.value));
+  print("dump: " + memRead(inst.value, 64));   // 对象头部（isa / 前几个 ivar）
+}
+```
 
 ### dyld / 符号解析（V2 新增）🟡
 | 原语 | 签名 | 说明 |
@@ -287,9 +303,21 @@ function kr(c) {
 }
 ```
 
+### 保活与灵动岛（V2.2；只在监听期间生效）🟡
+| 原语 | 签名 | 说明 |
+|---|---|---|
+| **`keepAliveStatus()`** | `() → string` | 一行状态，形如 `保活: 开(音频√ 重启0 续期12)` |
+| **`keepAliveInfo()`** | `() → JSON` | `{active, reason, audioPlaying, audioRestarts, bgTaskRenewals, background, status}` |
+| **`liveActivityStatus()`** | `() → JSON` | `{available, active}` —— 灵动岛实时活动是否被系统允许 / 当前是否在跑 |
+
+- 保活**由 Autorun 监听开关驱动**：`autorunStart` 自动开、`autorunStop` 立刻释放；JS 只能查不能改。
+- 机制：静音（≈-78 dBFS）音频循环 + `beginBackgroundTask` 每 8s 无限续期 + 8s 脉冲自愈（被通话/录音抢走音频会话后自动要回）。
+- 效果：**监听期间可切后台 / 锁屏**，电脑端仍能连；灵动岛 / 锁屏实时活动显示「监听中」+ 天线图标 + 端口 + 连接数 + 已运行时长，每次 HTTP 命中都会刷新连接数。
+- 限制（诚实）：低电量模式、系统回收压力、录音占用仍可能中断。**判断"还活着"只认 ping**，不要只看灵动岛在不在。
+
 ### 没有的能力（别浪费时间找）
-`setTimeout/setInterval`（用 `sleep`）、跨执行保留变量（落盘）、进程列表（`sysctlGet`+`iokitEnum`）、
-Keychain、ObjC 运行时 / dlopen、后台常驻监听（iOS 限制，App 必须前台）。
+`setTimeout/setInterval`（用 `sleep`）、跨执行保留变量（落盘）、返回 `float`/`struct` 的方法（msgSend 只取整型/指针寄存器）、
+block 参数方法、开放 Keychain 明文（`keychainProbe` 只做读探测）、内核内存 / 页表（`memRead` 只能读本进程映射）、永久后台常驻（保活是"极大延长"不是豁免）。
 
 ## 安全红线（不可由被执行的代码自行决定）
 
@@ -303,7 +331,8 @@ Keychain、ObjC 运行时 / dlopen、后台常驻监听（iOS 限制，App 必�
 ## 历史与依赖
 
 - 服务实现：`RyConsole/PayloadApp/AutorunServer.{h,m}`（原生，监听 + 极简 HTTP + 任务队列 + 面板）
-- **原生桥完整参考：`RyConsole/PRIMITIVES.md`**（67 个原语的签名/返回值/安全分级/用法示例，比本技能更详细）
+- **原生桥完整参考：`RyConsole/PRIMITIVES.md`**（68 个原语的签名/返回值/安全分级/用法示例，比本技能更详细）
+- 保活实现：`RyConsole/PayloadApp/KeepAlive.{h,m}` ｜ 灵动岛：`PayloadApp/LiveActivity.swift` + `PayloadApp/Widget/RyConsoleWidget.swift` + `PayloadApp/LiveActivityBridge.h`（Widget Extension target `RyConsoleWidget`；改动需重编）
 - 使用说明：`RyConsole/AUTORUN.md` ｜ 协议与后端设计：`RyConsole/AI_BACKEND.md`
 - 安全条款：`RyConsole/DISCLAIMER.md`
 - 改了原生代码（`main.m` 的 `installPrimitives` / `AutorunServer.m`）需重编 IPA；只改 JS 探针无需重编。
