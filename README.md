@@ -1,3 +1,10 @@
+
+> **本仓库已并入 `https://github.com/DanMianBenMian/RyConsole`（2026-10-30）。**
+> 源码、release 与全部安装包现已统一在 RyConsole 仓库；本仓库仅作历史留存。
+> - 新地址：`https://github.com/DanMianBenMian/RyConsole`
+> - Autorun 客户端源码目录：`RyConsoleAutorun/`
+> - 历史 release 已迁移至 RyConsole 仓库的 Releases 页面（tag 名保持不变）。
+
 # RyConsole Autorun
 
 让 AI 在电脑端把 **JS 探针** 发到局域网里的 iPad（**RyConsole**）执行，再把结果回传——用于 iOS 安全研究的自测与动态验证。
